@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║         ISHXONA ISH VAQTI BOTI — v2.0                              ║
-║         python-telegram-bot==21.10 | Python 3.13+                  ║
+║         ISHXONA ISH VAQTI BOTI — v3.0                              ║
+║         python-telegram-bot==21.10 | Python 3.11+                  ║
 ║         Bot: @ishxona_ishvaqtibot                                   ║
 ║         Developer ID: 8346931722                                    ║
 ╚══════════════════════════════════════════════════════════════════════╝
@@ -27,6 +27,9 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -46,12 +49,13 @@ BOT_TOKEN        = os.environ.get("BOT_TOKEN", "8814493938:AAHzLkvvhS3nRM61bkPSO
 SUPER_ADMIN_ID   = int(os.environ.get("SUPER_ADMIN_ID",   "8346931722"))
 DEFAULT_ADMIN_ID = int(os.environ.get("DEFAULT_ADMIN_ID", "7918082766"))
 
-DB_PATH      = "attendance.db"
-TASHKENT_TZ  = pytz.timezone("Asia/Tashkent")
+DB_PATH     = "attendance.db"
+TASHKENT_TZ = pytz.timezone("Asia/Tashkent")
 
 WORK_START_H, WORK_START_M = 8, 30
 WORK_END_H,   WORK_END_M   = 20, 0
 
+# user_data state keys
 STATE          = "state"
 WARN_WORKER_ID = "warn_worker_id"
 S_ADD_WORKER   = "add_worker"
@@ -59,11 +63,15 @@ S_ADD_ADMIN    = "add_admin"
 S_ADD_MANAGER  = "add_manager"
 S_BROADCAST    = "broadcast"
 S_WARN_MSG     = "warn_msg"
+S_WAITING_CONTACT = "waiting_contact"
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO,
-    handlers=[logging.StreamHandler(), logging.FileHandler("bot.log", encoding="utf-8")],
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("bot.log", encoding="utf-8"),
+    ],
 )
 log = logging.getLogger(__name__)
 
@@ -86,6 +94,7 @@ def init_db() -> None:
                 name        TEXT    NOT NULL,
                 telegram_id INTEGER UNIQUE,
                 username    TEXT,
+                phone       TEXT,
                 added_date  TEXT    NOT NULL,
                 is_active   INTEGER DEFAULT 1
             );
@@ -114,7 +123,20 @@ def init_db() -> None:
                 sent_by     INTEGER,
                 FOREIGN KEY (worker_id) REFERENCES workers(id)
             );
+            CREATE TABLE IF NOT EXISTS registered_users (
+                telegram_id INTEGER PRIMARY KEY,
+                username    TEXT,
+                first_name  TEXT,
+                phone       TEXT,
+                registered_date TEXT
+            );
         """)
+        # phone ustuni mavjud bo'lmasa qo'shish (eski DB uchun)
+        try:
+            conn.execute("ALTER TABLE workers ADD COLUMN phone TEXT")
+        except Exception:
+            pass
+
         now = now_tashkent().strftime("%Y-%m-%d %H:%M:%S")
         conn.execute(
             "INSERT OR IGNORE INTO admins(telegram_id,name,role,added_date) VALUES(?,?,?,?)",
@@ -155,7 +177,7 @@ def fmt_date_full(date_str: str) -> str:
         return date_str
 
 def hm(minutes: int) -> str:
-    h, m = divmod(minutes, 60)
+    h, m = divmod(int(minutes or 0), 60)
     return f"{h} soat {m} daqiqa" if h else f"{m} daqiqa"
 
 def late_minutes_calc(time_str: str) -> int:
@@ -181,10 +203,44 @@ def all_admin_ids() -> list:
         rows = conn.execute("SELECT telegram_id FROM admins").fetchall()
     return [r["telegram_id"] for r in rows]
 
+def is_registered(uid: int) -> bool:
+    """Foydalanuvchi kontaktini berganligi tekshiriladi."""
+    with db() as conn:
+        row = conn.execute(
+            "SELECT telegram_id FROM registered_users WHERE telegram_id=?", (uid,)
+        ).fetchone()
+    return row is not None
+
+def save_registered_user(uid: int, username: str, first_name: str, phone: str) -> None:
+    """Foydalanuvchini ro'yxatdan o'tkazadi va worker jadvalini yangilaydi."""
+    now_s = now_tashkent().strftime("%Y-%m-%d %H:%M:%S")
+    with db() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO registered_users(telegram_id, username, first_name, phone, registered_date)
+            VALUES(?,?,?,?,?)
+        """, (uid, username, first_name, phone, now_s))
+        # Worker jadvalini telegram_id va username bilan yangilaymiz
+        # Avval telegram_id bo'yicha tekshirish
+        conn.execute("""
+            UPDATE workers
+            SET telegram_id=?, username=?, phone=?
+            WHERE telegram_id=?
+        """, (uid, username, phone, uid))
+        # Agar hech narsa yangilanmasa, phone ni yangilaymiz (allaqachon bog'langan bo'lsa)
+        conn.execute("""
+            UPDATE workers SET phone=?, username=?
+            WHERE telegram_id=? AND (phone IS NULL OR phone='')
+        """, (phone, username, uid))
+
 
 # ═══════════════════════════════════════════════════════════════
 #                         KLAVIATURALAR
 # ═══════════════════════════════════════════════════════════════
+
+def kb_contact() -> ReplyKeyboardMarkup:
+    """Kontakt yuborish tugmasi."""
+    btn = KeyboardButton("📱 Kontaktimni ulashish", request_contact=True)
+    return ReplyKeyboardMarkup([[btn]], resize_keyboard=True, one_time_keyboard=True)
 
 def kb_main(uid: int) -> InlineKeyboardMarkup:
     rows = [
@@ -216,11 +272,11 @@ def kb_admin(uid: int) -> InlineKeyboardMarkup:
     ]
     if role in ("superadmin", "admin"):
         rows += [
-            [InlineKeyboardButton("👤 Admin qo'shish",   callback_data="add_admin"),
-             InlineKeyboardButton("🗑 Admin o'chirish",  callback_data="del_admin_list")],
-            [InlineKeyboardButton("👨 Manager qo'shish", callback_data="add_manager"),
-             InlineKeyboardButton("🗑 Manager o'chirish",callback_data="del_manager_list")],
-            [InlineKeyboardButton("📋 Adminlar ro'yxati",callback_data="list_admins")],
+            [InlineKeyboardButton("👤 Admin qo'shish",    callback_data="add_admin"),
+             InlineKeyboardButton("🗑 Admin o'chirish",   callback_data="del_admin_list")],
+            [InlineKeyboardButton("👨 Manager qo'shish",  callback_data="add_manager"),
+             InlineKeyboardButton("🗑 Manager o'chirish", callback_data="del_manager_list")],
+            [InlineKeyboardButton("📋 Adminlar ro'yxati", callback_data="list_admins")],
         ]
     rows.append([InlineKeyboardButton("🏠 Asosiy menyu", callback_data="main_menu")])
     return InlineKeyboardMarkup(rows)
@@ -238,12 +294,40 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid  = user.id
     now  = now_tashkent()
 
-    with db() as conn:
-        conn.execute(
-            "UPDATE workers SET telegram_id=?, username=? WHERE telegram_id=?",
-            (uid, user.username, uid),
-        )
+    # Admin bo'lsa kontakt so'ramasdan to'g'ridan kiradi
+    if is_admin(uid):
+        await show_main_menu(update, ctx, uid, user.first_name, now)
+        return
 
+    # Allaqachon ro'yxatdan o'tgan bo'lsa — asosiy menyu
+    if is_registered(uid):
+        # username ni yangilab qo'yamiz
+        with db() as conn:
+            conn.execute(
+                "UPDATE workers SET username=? WHERE telegram_id=?",
+                (user.username, uid)
+            )
+            conn.execute(
+                "UPDATE registered_users SET username=? WHERE telegram_id=?",
+                (user.username, uid)
+            )
+        await show_main_menu(update, ctx, uid, user.first_name, now)
+        return
+
+    # Yangi foydalanuvchi — kontakt so'rash
+    ctx.user_data[STATE] = S_WAITING_CONTACT
+    await update.message.reply_text(
+        f"👋 Salom, <b>{user.first_name}</b>!\n\n"
+        f"🏢 <b>Ishxona Ish Vaqti Tizimi</b>ga xush kelibsiz!\n\n"
+        f"📱 Tizimdan foydalanish uchun <b>kontaktingizni ulashing</b>.\n"
+        f"Pastdagi tugmani bosing:",
+        reply_markup=kb_contact(),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def show_main_menu(update, ctx, uid: int, first_name: str, now: datetime) -> None:
+    """Asosiy menyuni ko'rsatadi."""
     hour  = now.hour
     greet = ("🌅 Xayrli tong" if 5 <= hour < 12 else
              "☀️ Xayrli kun"  if 12 <= hour < 17 else
@@ -254,7 +338,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     role_txt = role_map.get(get_role(uid), "👤 Xodim")
 
     text = (
-        f"{greet}, <b>{user.first_name}</b>!\n\n"
+        f"{greet}, <b>{first_name}</b>!\n\n"
         f"🏢 <b>Ishxona Ish Vaqti Tizimi</b>\n"
         f"{'━'*22}\n"
         f"📌 Rol: <b>{role_txt}</b>\n"
@@ -265,7 +349,88 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f" – {WORK_END_H:02d}:{WORK_END_M:02d}</b>\n\n"
         f"Kerakli bo'limni tanlang:"
     )
-    await update.message.reply_text(text, reply_markup=kb_main(uid), parse_mode=ParseMode.HTML)
+    await update.message.reply_text(
+        text,
+        reply_markup=ReplyKeyboardRemove(),
+        parse_mode=ParseMode.HTML,
+    )
+    await update.message.reply_text(
+        "📋 Menyu:",
+        reply_markup=kb_main(uid),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+#                   KONTAKT HANDLER
+# ═══════════════════════════════════════════════════════════════
+
+async def on_contact(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Foydalanuvchi kontakt yuborganda ishlaydi."""
+    user    = update.effective_user
+    uid     = user.id
+    contact = update.message.contact
+
+    # Faqat o'z kontaktini yuborishi kerak
+    if contact.user_id != uid:
+        await update.message.reply_text(
+            "❌ Iltimos, faqat <b>o'z kontaktingizni</b> yuboring!",
+            reply_markup=kb_contact(),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    phone    = contact.phone_number or ""
+    username = user.username or ""
+    fname    = user.first_name or ""
+
+    # Ro'yxatdan o'tkazish
+    save_registered_user(uid, username, fname, phone)
+
+    # Worker jadvalida shu telegram_id bor-yo'qligini tekshiramiz
+    # Agar yo'q bo'lsa, yangi worker sifatida qo'shamiz (o'zi ro'yxatdan o'tgan)
+    with db() as conn:
+        existing = conn.execute(
+            "SELECT id FROM workers WHERE telegram_id=?", (uid,)
+        ).fetchone()
+        if not existing:
+            # Hali worker sifatida qo'shilmagan — ro'yxatga kiritamiz
+            now_s = now_tashkent().strftime("%Y-%m-%d %H:%M:%S")
+            conn.execute(
+                "INSERT OR IGNORE INTO workers(name, telegram_id, username, phone, added_date) VALUES(?,?,?,?,?)",
+                (fname, uid, username, phone, now_s)
+            )
+
+    ctx.user_data.clear()
+
+    now = now_tashkent()
+    await update.message.reply_text(
+        f"✅ <b>Muvaffaqiyatli ro'yxatdan o'tdingiz!</b>\n\n"
+        f"👤 Ism: <b>{fname}</b>\n"
+        f"📱 Telefon: <b>{phone}</b>\n"
+        f"📛 Username: <b>{'@'+username if username else '—'}</b>\n\n"
+        f"Endi tizimdan to'liq foydalanishingiz mumkin! 🎉",
+        reply_markup=ReplyKeyboardRemove(),
+        parse_mode=ParseMode.HTML,
+    )
+
+    # Adminga xabar
+    uname_txt = f"@{username}" if username else "—"
+    msg = (
+        f"🆕 <b>YANGI FOYDALANUVCHI</b>\n"
+        f"{'━'*20}\n"
+        f"👤 Ism: <b>{fname}</b>\n"
+        f"🆔 Telegram ID: <code>{uid}</code>\n"
+        f"📛 Username: {uname_txt}\n"
+        f"📱 Telefon: <b>{phone}</b>\n"
+        f"📅 Sana: <b>{fmt_date_full(now.strftime('%Y-%m-%d'))}</b>"
+    )
+    for aid in all_admin_ids():
+        try:
+            await ctx.bot.send_message(aid, msg, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+
+    await show_main_menu(update, ctx, uid, fname, now)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -278,6 +443,11 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     d   = q.data
     await q.answer()
 
+    # Ro'yxatdan o'tmagan va admin bo'lmagan foydalanuvchi
+    if not is_registered(uid) and not is_admin(uid):
+        await q.answer("Avval /start bosing va kontaktingizni ulashing!", show_alert=True)
+        return
+
     try:
         if d == "main_menu":
             ctx.user_data.clear()
@@ -289,18 +459,20 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 reply_markup=kb_main(uid), parse_mode=ParseMode.HTML,
             )
 
+        # ── Keldi/Ketdi ───────────────────────────────────────
         elif d == "att_menu":
-            await show_att_menu(q)
+            await show_att_menu(q, uid)
 
         elif d.startswith("ws_"):
-            await show_worker_actions(q, int(d[3:]))
+            await show_worker_actions(q, uid, int(d[3:]))
 
         elif d.startswith("in_"):
-            await record(q, ctx, int(d[3:]), "in")
+            await record(q, ctx, uid, int(d[3:]), "in")
 
         elif d.startswith("out_"):
-            await record(q, ctx, int(d[4:]), "out")
+            await record(q, ctx, uid, int(d[4:]), "out")
 
+        # ── Hisobot ───────────────────────────────────────────
         elif d == "rep_menu":
             if not is_admin(uid):
                 await q.edit_message_text("❌ Ruxsat yo'q.", reply_markup=kb_back())
@@ -322,6 +494,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             if not is_admin(uid): return
             await send_word(q, ctx)
 
+        # ── Admin panel ───────────────────────────────────────
         elif d == "adm_panel":
             if not is_admin(uid):
                 await q.edit_message_text("❌ Admin huquqi yo'q.")
@@ -345,7 +518,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             if not is_admin(uid): return
             ctx.user_data[STATE] = S_ADD_WORKER
             await q.edit_message_text(
-                "➕ <b>Yangi ishchi qo'shish</b>\n\nIshchining <b>Ism Familiyasini</b> kiriting:",
+                "➕ <b>Yangi ishchi qo'shish</b>\n\n"
+                "Ishchining <b>Ism Familiyasini</b> kiriting:\n"
+                "<i>Masalan: Alisher Karimov</i>",
                 reply_markup=kb_back("adm_panel"), parse_mode=ParseMode.HTML,
             )
 
@@ -385,7 +560,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             if not is_admin(uid): return
             ctx.user_data[STATE] = S_BROADCAST
             await q.edit_message_text(
-                "📢 <b>Hammaga xabar</b>\n\nXabar matnini yozing:",
+                "📢 <b>Hammaga xabar</b>\n\nXabar matnini yozing:\n"
+                "<i>(Barcha ro'yxatdan o'tgan ishchilarga yuboriladi)</i>",
                 reply_markup=kb_back("adm_panel"), parse_mode=ParseMode.HTML,
             )
 
@@ -417,17 +593,38 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 #                   KELDI / KETDI
 # ═══════════════════════════════════════════════════════════════
 
-async def show_att_menu(q) -> None:
+async def show_att_menu(q, uid: int) -> None:
+    """Ishchilar ro'yxatini ko'rsatadi.
+    Oddiy xodim faqat o'zini ko'radi, admin hammani ko'radi."""
     with db() as conn:
-        workers = conn.execute(
-            "SELECT id, name FROM workers WHERE is_active=1 ORDER BY name"
-        ).fetchall()
+        if is_admin(uid):
+            workers = conn.execute(
+                "SELECT id, name FROM workers WHERE is_active=1 ORDER BY name"
+            ).fetchall()
+        else:
+            # Oddiy xodim: faqat o'zi
+            workers = conn.execute(
+                "SELECT id, name FROM workers WHERE is_active=1 AND telegram_id=?",
+                (uid,)
+            ).fetchall()
 
     if not workers:
-        await q.edit_message_text(
-            "👥 Ishchilar yo'q.\nAdmin panel orqali qo'shing.",
-            reply_markup=kb_back(),
-        )
+        if not is_admin(uid):
+            await q.edit_message_text(
+                "❌ Siz tizimda ro'yxatga olinmagansiz.\n\n"
+                "Admin bilan bog'laning yoki /start bosing.",
+                reply_markup=kb_back(),
+            )
+        else:
+            await q.edit_message_text(
+                "👥 Ishchilar yo'q.\nAdmin panel orqali qo'shing.",
+                reply_markup=kb_back(),
+            )
+        return
+
+    if not is_admin(uid) and len(workers) == 1:
+        # Xodim faqat o'zini ko'rsa, to'g'ridan amal tanlash sahifasiga o'tamiz
+        await show_worker_actions(q, uid, workers[0]["id"])
         return
 
     btns = [[InlineKeyboardButton(f"👤 {w['name']}", callback_data=f"ws_{w['id']}")]
@@ -439,7 +636,17 @@ async def show_att_menu(q) -> None:
     )
 
 
-async def show_worker_actions(q, worker_id: int) -> None:
+async def show_worker_actions(q, uid: int, worker_id: int) -> None:
+    # Oddiy xodim faqat o'zi uchun bosishi mumkin
+    if not is_admin(uid):
+        with db() as conn:
+            check = conn.execute(
+                "SELECT id FROM workers WHERE id=? AND telegram_id=?", (worker_id, uid)
+            ).fetchone()
+        if not check:
+            await q.answer("❌ Bu amal faqat o'z yozuvingiZ uchun!", show_alert=True)
+            return
+
     with db() as conn:
         w    = conn.execute("SELECT name FROM workers WHERE id=?", (worker_id,)).fetchone()
         last = conn.execute(
@@ -469,7 +676,17 @@ async def show_worker_actions(q, worker_id: int) -> None:
     )
 
 
-async def record(q, ctx: ContextTypes.DEFAULT_TYPE, worker_id: int, action: str) -> None:
+async def record(q, ctx: ContextTypes.DEFAULT_TYPE, uid: int, worker_id: int, action: str) -> None:
+    # Xavfsizlik: oddiy xodim faqat o'zi uchun
+    if not is_admin(uid):
+        with db() as conn:
+            check = conn.execute(
+                "SELECT id FROM workers WHERE id=? AND telegram_id=?", (worker_id, uid)
+            ).fetchone()
+        if not check:
+            await q.answer("❌ Ruxsat yo'q!", show_alert=True)
+            return
+
     now      = now_tashkent()
     time_str = now.strftime("%Y-%m-%d %H:%M:%S")
     date_str = now.strftime("%Y-%m-%d")
@@ -499,8 +716,15 @@ async def record(q, ctx: ContextTypes.DEFAULT_TYPE, worker_id: int, action: str)
             (worker_id, action, time_str, date_str, is_late, late_min),
         )
         w = conn.execute(
-            "SELECT name, telegram_id, username FROM workers WHERE id=?", (worker_id,)
+            "SELECT name, telegram_id, username, phone FROM workers WHERE id=?", (worker_id,)
         ).fetchone()
+
+        # Agar worker jadvalida telegram_id yo'q bo'lsa, hozirgi UID ni yozamiz
+        if w and not w["telegram_id"]:
+            conn.execute(
+                "UPDATE workers SET telegram_id=?, username=? WHERE id=?",
+                (uid, q.from_user.username, worker_id)
+            )
 
     a_emoji   = "✅" if action == "in" else "🚪"
     a_txt     = "KELDI" if action == "in" else "KETDI"
@@ -514,13 +738,17 @@ async def record(q, ctx: ContextTypes.DEFAULT_TYPE, worker_id: int, action: str)
         reply_markup=kb_back("att_menu"), parse_mode=ParseMode.HTML,
     )
 
-    uname = f"@{w['username']}" if w["username"] else "—"
-    tg_id = str(w["telegram_id"]) if w["telegram_id"] else "—"
-    msg   = (
+    # Adminga xabar
+    actual_tg_id = w["telegram_id"] or uid
+    uname        = f"@{w['username'] or q.from_user.username}" if (w["username"] or q.from_user.username) else "—"
+    phone        = w["phone"] or "—"
+
+    msg = (
         f"{a_emoji} <b>XODIM {a_txt}</b>\n{'━'*20}\n"
         f"👤 Ism: <b>{w['name']}</b>\n"
-        f"🆔 Telegram ID: <code>{tg_id}</code>\n"
+        f"🆔 Telegram ID: <code>{actual_tg_id}</code>\n"
         f"📛 Username: {uname}\n"
+        f"📱 Telefon: <b>{phone}</b>\n"
         f"🕐 Vaqt: <b>{now.strftime('%H:%M:%S')}</b>\n"
         f"📅 Sana: <b>{fmt_date_full(date_str)}</b>"
     )
@@ -545,7 +773,7 @@ async def record(q, ctx: ContextTypes.DEFAULT_TYPE, worker_id: int, action: str)
 def fetch_attendance(start: str, end: str) -> list:
     with db() as conn:
         rows = conn.execute("""
-            SELECT w.name, w.telegram_id, w.username,
+            SELECT w.name, w.telegram_id, w.username, w.phone,
                    a.action, a.time, a.date, a.is_late, a.late_minutes
             FROM attendance a
             JOIN workers w ON a.worker_id = w.id
@@ -587,8 +815,8 @@ async def show_report(q, period: str) -> None:
         if r["action"] == "in":
             grp[n]["in"].append(r["time"][11:16])
             if r["is_late"]:
-                grp[n]["late"]    += 1
-                grp[n]["late_min"] += r["late_minutes"]
+                grp[n]["late"]     += 1
+                grp[n]["late_min"] += (r["late_minutes"] or 0)
         else:
             grp[n]["out"].append(r["time"][11:16])
 
@@ -606,7 +834,7 @@ async def show_report(q, period: str) -> None:
     text += f"{'━'*22}\n👥 Jami: <b>{len(grp)}</b> ishchi | ⚠️ Kechikish: <b>{total_late}</b> ta"
 
     if len(text) > 4000:
-        text = text[:3900] + "\n\n<i>...to'liq ma'lumot CSV/Word faylda</i>"
+        text = text[:3900] + "\n\n<i>...to'liq CSV/Word faylda</i>"
 
     await q.edit_message_text(text, reply_markup=kb_report(), parse_mode=ParseMode.HTML)
 
@@ -624,13 +852,14 @@ async def send_csv(q, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     buf = io.StringIO()
     wr  = csv.writer(buf, delimiter=";")
-    wr.writerow(["Ism Familiya","Telegram ID","Username",
+    wr.writerow(["Ism Familiya","Telegram ID","Username","Telefon",
                  "Amal","Vaqt","Sana","Kechikdimi","Kechikish (daqiqa)"])
     for r in data:
         wr.writerow([
             r["name"],
             r["telegram_id"] or "—",
             f"@{r['username']}" if r["username"] else "—",
+            r["phone"] or "—",
             "Keldi" if r["action"] == "in" else "Ketdi",
             r["time"][11:19],
             fmt_date_full(r["date"]),
@@ -696,7 +925,7 @@ async def send_word(q, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     mr.font.size = Pt(9)
     doc.add_paragraph()
 
-    hdrs = ["#","Ism Familiya","Telegram ID","Username","Amal","Vaqt","Sana","Kechikish"]
+    hdrs = ["#","Ism Familiya","Telegram ID","Username","Telefon","Amal","Vaqt","Sana","Kechikish"]
     tbl  = doc.add_table(rows=1, cols=len(hdrs))
     tbl.style = "Table Grid"
     hr = tbl.rows[0]
@@ -706,7 +935,7 @@ async def send_word(q, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         _shd(cell, "1a73e8")
         p  = cell.paragraphs[0]; p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         rn = p.runs[0]
-        rn.font.bold = True; rn.font.size = Pt(9)
+        rn.font.bold = True; rn.font.size = Pt(8)
         rn.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
 
     for idx, row in enumerate(data, 1):
@@ -714,9 +943,15 @@ async def send_word(q, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         a_txt = "Keldi" if row["action"] == "in" else "Ketdi"
         uname = f"@{row['username']}" if row["username"] else "—"
         late  = f"Ha ({hm(row['late_minutes'])})" if row["is_late"] else "Yoq"
-        vals  = [str(idx), row["name"], str(row["telegram_id"] or "—"),
-                 uname, a_txt, row["time"][11:19], fmt_date_full(row["date"]), late]
-        bg    = "FDEBD0" if row["is_late"] else ("EBF5FB" if idx % 2 == 0 else "FFFFFF")
+        vals  = [
+            str(idx), row["name"],
+            str(row["telegram_id"] or "—"),
+            uname,
+            row["phone"] or "—",
+            a_txt, row["time"][11:19],
+            fmt_date_full(row["date"]), late
+        ]
+        bg = "FDEBD0" if row["is_late"] else ("EBF5FB" if idx % 2 == 0 else "FFFFFF")
 
         for i, val in enumerate(vals):
             cell = tr.cells[i]
@@ -725,11 +960,11 @@ async def send_word(q, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             p  = cell.paragraphs[0]; p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             rn = p.runs[0] if p.runs else p.add_run(val)
             rn.font.size = Pt(8)
-            if row["is_late"] and i == 7:
+            if row["is_late"] and i == 8:
                 rn.font.color.rgb = RGBColor(0xE7, 0x4C, 0x3C)
                 rn.font.bold = True
 
-    widths = [Cm(0.7), Cm(3.8), Cm(2.4), Cm(2.8), Cm(1.8), Cm(1.8), Cm(4.8), Cm(2.9)]
+    widths = [Cm(0.6), Cm(3.2), Cm(2.2), Cm(2.4), Cm(2.6), Cm(1.6), Cm(1.6), Cm(4.2), Cm(2.4)]
     for row in tbl.rows:
         for i, cell in enumerate(row.cells):
             if i < len(widths):
@@ -772,7 +1007,7 @@ async def send_word(q, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def show_all_workers(q) -> None:
     with db() as conn:
         rows = conn.execute("""
-            SELECT w.id, w.name, w.telegram_id, w.username, w.added_date,
+            SELECT w.id, w.name, w.telegram_id, w.username, w.phone, w.added_date,
                    COUNT(a.id) AS total
             FROM workers w
             LEFT JOIN attendance a ON w.id = a.worker_id
@@ -788,11 +1023,16 @@ async def show_all_workers(q) -> None:
     for i, w in enumerate(rows, 1):
         uname = f"@{w['username']}" if w["username"] else "—"
         tid   = str(w["telegram_id"]) if w["telegram_id"] else "—"
+        phone = w["phone"] or "—"
         text += (
             f"{i}. <b>{w['name']}</b>\n"
             f"   🆔 <code>{tid}</code>  📛 {uname}\n"
-            f"   📅 {fmt_dt(w['added_date'])}  |  📊 {w['total']} qayd\n\n"
+            f"   📱 {phone}  |  📊 {w['total']} qayd\n\n"
         )
+
+    if len(text) > 4000:
+        text = text[:3900] + "\n\n<i>...ro'yxat juda uzun</i>"
+
     await q.edit_message_text(text, reply_markup=kb_back("adm_panel"), parse_mode=ParseMode.HTML)
 
 
@@ -833,7 +1073,7 @@ async def show_all_admins(q) -> None:
         rows = conn.execute("SELECT * FROM admins ORDER BY role, added_date").fetchall()
     emoji_map = {"superadmin": "👑", "admin": "🔑", "manager": "👨"}
     name_map  = {"superadmin": "Developer", "admin": "Admin", "manager": "Manager"}
-    text = f"👥 <b>Adminlar Royxati</b>\n{'━'*22}\n\n"
+    text = f"👥 <b>Adminlar Ro'yxati</b>\n{'━'*22}\n\n"
     for a in rows:
         text += (
             f"{emoji_map.get(a['role'],'👤')} <b>{a['name'] or 'Nomsiz'}</b>"
@@ -912,7 +1152,9 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 conn.execute("INSERT INTO workers(name, added_date) VALUES(?,?)", (text, now_s))
             ctx.user_data.clear()
             await update.message.reply_text(
-                f"✅ <b>{text}</b> qo'shildi!",
+                f"✅ <b>{text}</b> qo'shildi!\n\n"
+                f"<i>Ishchi /start bosib kontaktini ulashgandan so'ng "
+                f"Telegram ID va telefon raqami avtomatik saqlanadi.</i>",
                 reply_markup=kb_admin(uid), parse_mode=ParseMode.HTML,
             )
 
@@ -970,19 +1212,30 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
         elif state == S_BROADCAST:
             with db() as conn:
-                workers = conn.execute(
-                    "SELECT telegram_id FROM workers WHERE is_active=1 AND telegram_id IS NOT NULL"
+                # Barcha ro'yxatdan o'tgan foydalanuvchilarga
+                users = conn.execute(
+                    "SELECT telegram_id FROM registered_users"
                 ).fetchall()
+                # Adminlarga ham
+                admins = conn.execute("SELECT telegram_id FROM admins").fetchall()
+
+            all_ids = set(u["telegram_id"] for u in users) | set(a["telegram_id"] for a in admins)
+            all_ids.discard(uid)  # o'ziga yubormasin
+
             sent = failed = 0
-            msg = (f"📢 <b>Korxona Xabari</b>\n{'━'*20}\n{text}\n\n"
-                   f"<i>— Ishxona Boshqaruvi</i>")
-            for w in workers:
+            msg = (
+                f"📢 <b>Korxona Xabari</b>\n{'━'*20}\n\n"
+                f"{text}\n\n"
+                f"<i>— Ishxona Boshqaruvi</i>"
+            )
+            for tid in all_ids:
                 try:
-                    await ctx.bot.send_message(w["telegram_id"], msg, parse_mode=ParseMode.HTML)
+                    await ctx.bot.send_message(tid, msg, parse_mode=ParseMode.HTML)
                     sent += 1
                     await asyncio.sleep(0.05)
                 except Exception:
                     failed += 1
+
             ctx.user_data.clear()
             await update.message.reply_text(
                 f"✅ Xabar yuborildi!\n📤 {sent} ta  |  ❌ {failed} ta xato",
@@ -1004,22 +1257,38 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     (wid, text, now_s, uid),
                 )
             ctx.user_data.clear()
+
+            warn_text = (
+                f"⚠️ <b>OGOHLANTIRISH</b>\n{'━'*20}\n\n"
+                f"{text}\n\n"
+                f"<i>— Korxona Boshqaruvi</i>"
+            )
+
             if w and w["telegram_id"]:
                 try:
                     await ctx.bot.send_message(
-                        w["telegram_id"],
-                        f"⚠️ <b>OGOHLANTIRISH</b>\n{'━'*20}\n{text}\n\n<i>— Korxona Boshqaruvi</i>",
-                        parse_mode=ParseMode.HTML,
+                        w["telegram_id"], warn_text, parse_mode=ParseMode.HTML,
                     )
                 except Exception:
                     pass
+
             await update.message.reply_text(
                 f"✅ <b>{w['name'] if w else 'Ishchi'}</b>ga ogohlantirish yuborildi.",
                 reply_markup=kb_admin(uid), parse_mode=ParseMode.HTML,
             )
 
+        elif state == S_WAITING_CONTACT:
+            # Kontakt yuborish so'ralganda matn yozsa
+            await update.message.reply_text(
+                "📱 Iltimos, pastdagi <b>tugmani bosing</b> va kontaktingizni ulashing:",
+                reply_markup=kb_contact(),
+                parse_mode=ParseMode.HTML,
+            )
+
         else:
-            await update.message.reply_text("Tugmalardan foydalaning:", reply_markup=kb_main(uid))
+            await update.message.reply_text(
+                "Tugmalardan foydalaning:", reply_markup=kb_main(uid)
+            )
 
     except Exception as e:
         log.exception(f"Xabar xatosi: {e}")
@@ -1075,7 +1344,10 @@ def main() -> None:
     init_db()
 
     app = Application.builder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", cmd_start))
+    # Kontakt handler — alohida, birinchi o'rinda
+    app.add_handler(MessageHandler(filters.CONTACT, on_contact))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
@@ -1087,14 +1359,14 @@ def main() -> None:
         log.info("Kunlik tekshiruv jadvallandi: 09:05 Toshkent")
 
     log.info("Bot ishga tushdi!")
-    print("\n" + "="*50)
-    print("   ISHXONA ISH VAQTI BOTI ISHGA TUSHDI")
-    print("="*50)
+    print("\n" + "="*52)
+    print("   ISHXONA ISH VAQTI BOTI v3.0 ISHGA TUSHDI")
+    print("="*52)
     print(f"   Bot     : @ishxona_ishvaqtibot")
     print(f"   Dev ID  : {SUPER_ADMIN_ID}")
     print(f"   Admin ID: {DEFAULT_ADMIN_ID}")
     print(f"   Ish     : {WORK_START_H:02d}:{WORK_START_M:02d} - {WORK_END_H:02d}:{WORK_END_M:02d}")
-    print("="*50 + "\n")
+    print("="*52 + "\n")
 
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
